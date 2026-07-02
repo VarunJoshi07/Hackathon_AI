@@ -1,0 +1,38 @@
+# Query: candidates.jsonl.gz
+# ContextLines: 1
+
+7 results - 6 files
+
+src\build_embeddings.py:
+  20  
+  21: DEFAULT_DATA_PATH = Path("data") / "candidates.jsonl.gz"
+  22  DEFAULT_OUTPUT_PATH = Path("artifacts") / "candidate_embeddings.npy"
+
+src\build_feature_table.py:
+  19  
+  20: DEFAULT_DATA_PATH = Path("data") / "candidates.jsonl.gz"
+  21  DEFAULT_OUTPUT_PATH = Path("artifacts") / "feature_table.parquet"
+
+src\build_penalties.py:
+  22  
+  23: DEFAULT_DATA_PATH = Path("data") / "candidates.jsonl.gz"
+  24  DEFAULT_OUTPUT_PATH = Path("artifacts") / "penalty_metadata.parquet"
+
+src\build_skill_vocab.py:
+  18  
+  19: DEFAULT_DATA_PATH = Path("data") / "candidates.jsonl.gz"
+  20  DEFAULT_ARTIFACT_PATH = Path("artifacts") / "skill_vocab.json"
+
+src\build_tfidf.py:
+  21  
+  22: DEFAULT_DATA_PATH = Path("data") / "candidates.jsonl.gz"
+  23  DEFAULT_ARTIFACTS_DIR = Path("artifacts")
+
+src\inspect_schema.py:
+  101  
+  102: def main(path: Path = Path("data") / "candidates.jsonl.gz") -> None:
+  103      """Load and print schema information for the first candidate."""
+
+  109      logging.basicConfig(level=logging.INFO)
+  110:     input_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("data") / "candidates.jsonl.gz"
+  111      main(input_path)
