@@ -1,8 +1,0 @@
-numpy
-pandas
-tqdm
-scikit-learn
-scipy
-joblib
-sentence-transformers
-torch
