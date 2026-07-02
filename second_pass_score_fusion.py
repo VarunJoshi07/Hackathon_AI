@@ -77,7 +77,7 @@ def fuse_second_pass_scores(
 
         final_score = base_score - penalty * PENALTY_MULTIPLIER
         final_score = max(0.0, min(1.0, final_score))
-        final_score *= 100
+        final_score = 100
 
         fused_results.append(
             {
