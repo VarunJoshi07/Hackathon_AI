@@ -49,7 +49,7 @@ class RankingOrchestrator:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        submission_path = output_dir / "team_xyz.csv"
+        submission_path = output_dir / "team_Veridis_Quo.csv"
 
         jd_text = self.load_jd(jd_path)
 
