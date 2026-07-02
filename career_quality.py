@@ -1,13 +1,14 @@
 """Module for computing a deterministic career quality metric for candidate profiles.
 
 This module scores a candidate's professional trajectory by analyzing specific quality 
-signals (career progression, average tenure, promotions, top-tier/production company 
-experience, leadership roles, and stable employment) while applying granular deductions 
-for negative signals (job hopping, repeated internships, and inconsistent progression).
+signals from the available candidate schema (years of experience, current title seniority,
+company tier, skill maturity, assessment scores, and profile signals) while handling 
+missing values or string-encoded JSON inputs gracefully.
 
 The resulting scores are mapped and returned strictly bounded between 0.0 and 1.0.
 """
 
+import json
 import logging
 from collections.abc import Mapping, Sequence
 from typing import Any, Final
@@ -16,210 +17,254 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Constants for evaluation thresholds
-MIN_STABLE_TENURE_YEARS: Final[float] = 2.0
-MAX_JOB_HOPPING_TENURE_YEARS: Final[float] = 1.0
-INTERNSHIP_MAX_MONTHS: Final[float] = 8.0
-
 # Pre-defined list of recognizable tier-1/production-scale tech organizations
 PRODUCTION_COMPANIES: Final[frozenset[str]] = frozenset({
     "google", "amazon", "apple", "netflix", "meta", "microsoft", "uber", 
-    "airbnb", "stripe", "salesforce", "atlassian", "nvidia"
+    "airbnb", "stripe", "salesforce", "adobe", "atlassian", "databricks", 
+    "openai", "oracle", "ibm", "intel", "cisco"
 })
 
-# Executive and organizational leadership keywords
-LEADERSHIP_TERMS: Final[frozenset[str]] = frozenset({
-    "lead", "principal", "staff", "manager", "director", "head", "vp", 
-    "chief", "cto", "architect", "founder", "co-founder"
-})
+# Seniority title keywords and their normalized weight mappings
+TITLE_KEYWORDS: Final[dict[str, float]] = {
+    "intern": 0.1,
+    "trainee": 0.1,
+    "junior": 0.3,
+    "engineer": 0.5,
+    "developer": 0.5,
+    "analyst": 0.5,
+    "associate": 0.5,
+    "senior": 0.7,
+    "lead": 0.85,
+    "architect": 0.85,
+    "principal": 0.95,
+    "staff": 0.95,
+    "director": 1.0,
+    "head": 1.0,
+    "vp": 1.0,
+    "chief": 1.0,
+    "cto": 1.0
+}
+
+# Scoring Weights Configurations (Sum up to 1.0)
+EXPERIENCE_WEIGHT: Final[float] = 0.25
+TITLE_WEIGHT: Final[float] = 0.20
+COMPANY_WEIGHT: Final[float] = 0.15
+SKILL_QUALITY_WEIGHT: Final[float] = 0.20
+ASSESSMENT_WEIGHT: Final[float] = 0.10
+PROFILE_WEIGHT: Final[float] = 0.10
 
 
-def _parse_job_history(employment_history: Any) -> list[dict[str, Any]]:
-    """Normalizes and extracts a structured job history from raw inputs.
+def _safe_parse_json(field_value: Any) -> Any:
+    """Safely converts a potential JSON string into a structured dictionary or list."""
+    if isinstance(field_value, (str, bytes)):
+        try:
+            return json.loads(field_value)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Failed to decode JSON string field, defaulting to empty structure.")
+            return None
+    return field_value
+
+
+def _calculate_single_career_quality(candidate: Mapping[str, Any]) -> float:
+    """Computes the blended career quality score for a single candidate profile."""
     
-    Adopts a parsing schema designed to safely ingest single mappings or 
-    sequences, mirroring behavior found in experience_score.py[cite: 3].
-    """
-    if isinstance(employment_history, Mapping):
-        return [dict(employment_history)]
-    if isinstance(employment_history, Sequence) and not isinstance(employment_history, str):
-        return [dict(job) for job in employment_history if isinstance(job, Mapping)]
-    return []
-
-
-def _coerce_float(value: Any, default: float = 0.0) -> float:
-    """Safely converts dynamic values to float types without throwing exceptions."""
-    if value is None or isinstance(value, bool):
-        return default
+    # 1. Years of Experience Score Component
     try:
-        return float(value)
+        years_exp = float(candidate.get("years_experience", 0.0))
     except (ValueError, TypeError):
-        return default
+        years_exp = 0.0
 
+    if years_exp < 1.0:
+        exp_score = 0.10
+    elif years_exp <= 2.0:
+        exp_score = 0.25
+    elif years_exp <= 4.0:
+        exp_score = 0.45
+    elif years_exp <= 6.0:
+        exp_score = 0.65
+    elif years_exp <= 10.0:
+        exp_score = 0.85
+    else:
+        exp_score = 1.00
 
-def _analyze_single_career_profile(candidate: Mapping[str, Any]) -> float:
-    """Analyzes a single candidate's history to build a unified career quality score."""
-    history = _parse_job_history(candidate.get("employment_history"))
-    
-    # Extract structural summaries or calculate fallbacks
-    total_years = _coerce_float(candidate.get("years_experience"), 0.0)
-    num_jobs = len(history)
-    
-    # 1. Base Metrics Initializations
-    tenures: list[float] = []
-    promotions = 0
-    production_exp = 0
-    leadership_exp = 0
-    internships = 0
-    progression_drops = 0
-    
-    # Track company transitions to compute promotions and track progression
-    # Assumes chronological descending order (Newest to Oldest)
-    prev_company: str | None = None
-    prev_level_idx: int = 99  # Smaller indicates higher tier or seniority
-    
-    levels_map = {"junior": 3, "mid": 2, "senior": 1, "lead": 0, "principal": 0, "staff": 0}
+    # 2. Current Title Seniority Score Component
+    current_title = str(candidate.get("current_title", "")).lower()
+    title_score = 0.5  # Neutral base score if no keywords match
+    matched_scores = [score for kw, score in TITLE_KEYWORDS.items() if kw in current_title]
+    if matched_scores:
+        title_score = max(matched_scores)
 
-    for job in history:
-        # Resolve individual tenure
-        # Handles raw years if pre-calculated, or defaults to a standardized baseline
-        job_years = _coerce_float(job.get("years_experience"), 0.0)
-        if job_years <= 0.0 and num_jobs > 0:
-            job_years = total_years / num_jobs if total_years > 0 else 1.0
-        tenures.append(job_years)
-        
-        # Match company profiles
-        company = str(job.get("company", "")).strip().lower()
-        if company in PRODUCTION_COMPANIES:
-            production_exp += 1
+    # 3. Company Quality Component
+    current_company = str(candidate.get("current_company", "")).strip().lower()
+    if current_company in PRODUCTION_COMPANIES:
+        company_score = 1.0
+    else:
+        company_score = 0.5  # Neutral value for unknown or smaller companies
+
+    # 4. Skills Maturity Component
+    skills_data = _safe_parse_json(candidate.get("skills"))
+    if not isinstance(skills_data, list):
+        skills_data = []
+
+    # Gather explicitly parsed skills or fallback to candidate's stated count
+    try:
+        num_skills = int(candidate.get("num_skills", len(skills_data)))
+    except (ValueError, TypeError):
+        num_skills = len(skills_data)
+
+    sub_skills_count = min(num_skills / 20.0, 1.0)
+    
+    durations = []
+    endorsements = []
+    proficiencies = []
+
+    for s in skills_data:
+        if isinstance(s, dict):
+            # Duration parsing
+            try:
+                durations.append(float(s.get("duration_months", 0.0)))
+            except (ValueError, TypeError):
+                pass
             
-        # Match inside-company internal promotions
-        if prev_company and company == prev_company:
-            promotions += 1
-        prev_company = company
-        
-        # Evaluate title mappings for leadership and hierarchical progression
-        title = str(job.get("title", "")).strip().lower()
-        if any(term in title for term in LEADERSHIP_TERMS):
-            leadership_exp += 1
+            # Endorsement parsing
+            try:
+                endorsements.append(float(s.get("endorsements", 0.0)))
+            except (ValueError, TypeError):
+                pass
             
-        # Detect repeated internships
-        if "intern" in title or "internship" in title or (job_years * 12 <= INTERNSHIP_MAX_MONTHS and "intern" in title):
-            internships += 1
-            
-        # Inconsistent progression tracking (demotions or erratic transitions)
-        current_level_idx = 2  # Default to Mid level index
-        for lvl_keyword, idx_val in levels_map.items():
-            if lvl_keyword in title:
-                current_level_idx = idx_val
-                break
-        
-        if current_level_idx > prev_level_idx:
-            progression_drops += 1
-        prev_level_idx = current_level_idx
+            # Proficiency parsing
+            prof = str(s.get("proficiency", "")).lower()
+            if "advanced" in prof:
+                proficiencies.append(1.0)
+            elif "intermediate" in prof:
+                proficiencies.append(0.7)
+            elif "beginner" in prof:
+                proficiencies.append(0.3)
 
-    # Calculate Average Tenure safely
-    avg_tenure = np.mean(tenures) if tenures else total_years
-    
-    # 2. Score Component Aggregations
-    quality_score = 0.5  # Start from a balanced mid-point benchmark
-    
-    # Positive Accelerators
-    if avg_tenure >= MIN_STABLE_TENURE_YEARS:
-        quality_score += 0.15
-    if promotions > 0:
-        quality_score += 0.10
-    if production_exp > 0:
-        quality_score += 0.15
-    if leadership_exp > 0:
-        quality_score += 0.10
-    if total_years > 3.0 and progression_drops == 0:
-        quality_score += 0.10  # Healthy historical progression stability
-        
-    # Negative Deductions / Penalties
-    if avg_tenure < MAX_JOB_HOPPING_TENURE_YEARS and num_jobs >= 3:
-        quality_score -= 0.25  # Job hopping penalty
-    if internships >= 3:
-        quality_score -= 0.15  # Repeated internships penalty
-    if progression_drops >= 2:
-        quality_score -= 0.15  # Inconsistent progression penalty
+    sub_duration = min(np.mean(durations) / 48.0, 1.0) if durations else 0.5
+    sub_endorsement = min(np.mean(endorsements) / 50.0, 1.0) if endorsements else 0.0
+    sub_proficiency = np.mean(proficiencies) if proficiencies else 0.5
 
-    return max(0.0, min(1.0, quality_score))
+    skill_quality_score = (sub_skills_count + sub_duration + sub_endorsement + sub_proficiency) / 4.0
+
+    # Parse redrob_signals object for the remaining blocks
+    signals = _safe_parse_json(candidate.get("redrob_signals"))
+    if not isinstance(signals, dict):
+        signals = {}
+
+    # 5. Skill Assessment Scores Component
+    assessment_scores = signals.get("skill_assessment_scores")
+    if isinstance(assessment_scores, dict) and assessment_scores:
+        valid_assessments = []
+        for val in assessment_scores.values():
+            try:
+                valid_assessments.append(float(val))
+            except (ValueError, TypeError):
+                pass
+        assessment_score = (sum(valid_assessments) / (100.0 * len(valid_assessments))) if valid_assessments else 0.5
+    else:
+        assessment_score = 0.5  # Neutral fallback score
+
+    # 6. Profile Quality Components
+    try:
+        p_completeness = float(signals.get("profile_completeness_score", 0.0)) / 100.0
+    except (ValueError, TypeError):
+        p_completeness = 0.0
+
+    try:
+        github_act = float(signals.get("github_activity_score", 0.0))
+        p_github = min(max(github_act, 0.0) / 10.0, 1.0)
+    except (ValueError, TypeError):
+        p_github = 0.0
+
+    try:
+        endorsements_rec = float(signals.get("endorsements_received", 0.0))
+        p_endorsements = min(endorsements_rec / 100.0, 1.0)
+    except (ValueError, TypeError):
+        p_endorsements = 0.0
+
+    try:
+        conn_count = float(signals.get("connection_count", 0.0))
+        p_connections = min(conn_count / 500.0, 1.0)
+    except (ValueError, TypeError):
+        p_connections = 0.0
+
+    p_email = 1.0 if bool(signals.get("verified_email", False)) else 0.0
+    p_phone = 1.0 if bool(signals.get("verified_phone", False)) else 0.0
+
+    profile_quality_score = (p_completeness + p_github + p_endorsements + p_connections + p_email + p_phone) / 6.0
+
+    # 7. Weighted Blend and Clamping
+    final_score = (
+        (exp_score * EXPERIENCE_WEIGHT)
+        + (title_score * TITLE_WEIGHT)
+        + (company_score * COMPANY_WEIGHT)
+        + (skill_quality_score * SKILL_QUALITY_WEIGHT)
+        + (assessment_score * ASSESSMENT_WEIGHT)
+        + (profile_quality_score * PROFILE_WEIGHT)
+    )
+
+    return float(np.clip(final_score, 0.0, 1.0))
 
 
 def calculate_career_quality_scores(candidates: Sequence[Mapping[str, Any]]) -> np.ndarray:
-    """Calculates professional quality and structural scores for candidates.
+    """Calculates deterministic career quality metrics for a pool of candidates.
 
     Args:
-        candidates: A sequence of mapping objects representing candidate parameters.
+        candidates: A sequence of candidate record dictionaries conforming to the active schema.
 
     Returns:
-        A 1D numpy.ndarray containing float64 values normalized between 0.0 and 1.0.
+        A NumPy array of float64 scores mapped strictly within the [0.0, 1.0] envelope.
     """
-    num_candidates = len(candidates)
-    if num_candidates == 0:
+    if not candidates:
         return np.empty(0, dtype=np.float64)
 
-    logger.info("Evaluating career quality components for %d candidates...", num_candidates)
-    
-    # pre-allocate space to handle large pools up to 100,000 rows efficiently
-    scores = np.zeros(num_candidates, dtype=np.float64)
-    
-    for idx, candidate in enumerate(candidates):
-        scores[idx] = _analyze_single_career_profile(candidate)
-        
-    return scores
-
-
-def main() -> None:
-    """Lightweight functional smoke test to verify profile quality scoring execution."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-    logger.info("Executing career_quality validation runner.")
-
-    # High quality engineering profile
-    candidate_strong = {
-        "candidate_id": "CAND_PROGRESSIVE",
-        "years_experience": 6.5,
-        "employment_history": [
-            {"company": "Google", "title": "Lead Backend Infrastructure Engineer", "years_experience": 2.5},
-            {"company": "Google", "title": "Senior Software Engineer", "years_experience": 2.0},
-            {"company": "Stripe", "title": "Software Engineer", "years_experience": 2.0}
-        ]
-    }
-
-    # Unstable / High-churn hopping profile
-    candidate_unstable = {
-        "candidate_id": "CAND_HOPPER",
-        "years_experience": 2.4,
-        "employment_history": [
-            {"company": "Startup A", "title": "Software Intern", "years_experience": 0.4},
-            {"company": "Startup B", "title": "Junior Developer", "years_experience": 0.5},
-            {"company": "Startup C", "title": "Software Engineer", "years_experience": 0.6},
-            {"company": "Startup D", "title": "Developer", "years_experience": 0.5},
-            {"company": "Startup E", "title": "Intern", "years_experience": 0.4}
-        ]
-    }
-
-    pool = [candidate_strong, candidate_unstable]
-    
-    try:
-        scores = calculate_career_quality_scores(pool)
-        
-        print("\n--- Smoke Test Score Aggregations ---")
-        print(f"Strong Profile Score  : {scores[0]:.4f}")
-        print(f"Unstable Profile Score: {scores[1]:.4f}")
-        print("--------------------------------------\n")
-        
-        assert scores[0] > scores[1], "Validation error: High tier profile should score above erratic ones."
-        assert 0.0 <= scores[0] <= 1.0 and 0.0 <= scores[1] <= 1.0, "Clamping constraints broken."
-        logger.info("Career quality module smoke-check succeeded.")
-        
-    except Exception as e:
-        logger.exception("Validation execution failure: %s", e)
+    scores = [_calculate_single_career_quality(candidate) for candidate in candidates]
+    return np.array(scores, dtype=np.float64)
 
 
 if __name__ == "__main__":
-    main()
+    # Lightweight smoke test to verify schema adaptations and fallback boundaries
+    logging.basicConfig(level=logging.INFO)
+    logger.info("Executing updated career quality module smoke test.")
+
+    mock_candidate_strong = {
+        "candidate_id": "CAND_STRONG_01",
+        "years_experience": 6.5,
+        "current_title": "Senior Staff Engineer",
+        "current_company": "Stripe",
+        "num_skills": 12,
+        "skills": [
+            {"name": "Python", "duration_months": 60, "endorsements": 45, "proficiency": "advanced"}
+        ],
+        "redrob_signals": {
+            "profile_completeness_score": 95.0,
+            "connection_count": 600,
+            "endorsements_received": 120,
+            "github_activity_score": 8.5,
+            "verified_email": True,
+            "verified_phone": True,
+            "skill_assessment_scores": {"Python": 92, "AWS": 85}
+        }
+    }
+
+    mock_candidate_minimal = {
+        "candidate_id": "CAND_MINIMAL_02",
+        "years_experience": "0.5",
+        "current_title": "Intern",
+        "current_company": "Unknown Startup",
+        "skills": "malformed_json_test_string",
+        "redrob_signals": "{}"
+    }
+
+    pool = [mock_candidate_strong, mock_candidate_minimal]
+    results = calculate_career_quality_scores(pool)
+
+    print("\n--- Smoke Test Results ---")
+    print(f"Strong Candidate Score: {results[0]:.4f}")
+    print(f"Minimal Candidate Score: {results[1]:.4f}")
+    print("--------------------------\n")
+
+    assert results[0] > results[1], "Pipeline error: Strong candidate should outscore minimal candidate."
+    assert all(0.0 <= s <= 1.0 for s in results), "Pipeline error: Scores out of bounding range [0.0, 1.0]."
+    logger.info("Smoke test passed successfully.")
